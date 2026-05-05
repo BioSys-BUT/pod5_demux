@@ -62,7 +62,7 @@ pip install .
 ### Installation from GitHub
 
 ```bash
-pip install git+https://github.com/ncechova/pod5_demux.git
+pip install git+https://github.com/BioSys-BUT/pod5_demux.git
 ```
 
 After installation, the `pod5_demux` command will be available:

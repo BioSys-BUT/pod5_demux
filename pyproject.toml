@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pod5-demux"
+version = "1.0.0"
+description = "A tool for demultiplexing raw nanopore signals from POD5 files based on classified sequencing data (BAM/SAM/FASTQ).
+"
+authors = [
+    {name = "Nikola Čechová", email = "256971@vutbr.cz"},
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "pod5",
+    "biopython",
+    "pysam; sys_platform != 'win32'",
+    "typer"
+]
+
+[project.scripts]
+pod5_demux = "pod5_demux.__main__:app"

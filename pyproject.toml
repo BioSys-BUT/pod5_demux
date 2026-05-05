@@ -5,8 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pod5-demux"
 version = "1.0.0"
-description = "A tool for demultiplexing raw nanopore signals from POD5 files based on classified sequencing data (BAM/SAM/FASTQ).
-"
+description = "A tool for demultiplexing raw nanopore signals from POD5 files based on classified sequencing data (BAM/SAM/FASTQ)."
 authors = [
     {name = "Nikola Čechová", email = "256971@vutbr.cz"},
 ]

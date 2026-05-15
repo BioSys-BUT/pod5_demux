@@ -163,7 +163,7 @@ def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str,
     return mapping, filename_map
  
  
-def _extract_bc_tag(block: bytes, offset: int) -> str:
+def _extract_bc_tag(block: bytes, offset: int) -> str|None:
     """
     Iterates through the optional tags of a BAM record and returns the 
     value of the BC (Barcode) or RG (Read Group) tag.
@@ -223,7 +223,7 @@ def _extract_bc_tag(block: bytes, offset: int) -> str:
     return rg_val  # BC not found, return RG (or None)
 
 
-def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, known_bc: Optional[str]) -> Tuple[Dict, Dict]:
+def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, known_bc: Optional[str]) -> Tuple[Dict, Dict, Dict]:
     """
     Parses a single sequence mapping file (BAM, SAM, or FASTQ) and extracts 
     read-to-barcode mappings. Automatically falls back to custom parsers 
@@ -231,6 +231,7 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
     """
     mapping = {}
     filename_map = {}
+    map_bc_count = {}
     
     clean_filename = Path(file_path).name
     for ext in [".fastq.gz", ".fastq", f".{file_type}"]:
@@ -311,9 +312,11 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
         except Exception as e:
             print(f"[Error] Failed to read FASTQ {file_path}: {e}")
 
-    return mapping, filename_map
+    for bc in mapping.values():
+        map_bc_count[bc] = map_bc_count.get(bc, 0) + 1
+    return mapping, filename_map, map_bc_count
 
-def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Optional[str], n_cores: int) -> Tuple[Dict, Dict]:
+def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Optional[str], n_cores: int) -> Tuple[Dict, Dict, Dict]:
     """
     Locates mapping files in the input path and constructs a large 
     lookup dictionary in parallel using multiple CPU cores.
@@ -334,13 +337,16 @@ def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Opt
 
     barcode_map = {}
     filename_map = {}
+    map_bc_count = {}
     
     worker = partial(parse_single_mapping_file, file_type=input_format, is_fmap=is_fmap, known_bc=known_bc)
     
     with Pool(processes=n_cores) as pool:
         results = pool.map(worker, files)
-        for m, fm in results:
+        for m, fm, bc_count in results:
             barcode_map.update(m)
             filename_map.update(fm)
+            for bc, count in bc_count.items():
+                map_bc_count[bc] = map_bc_count.get(bc, 0) + count
             
-    return barcode_map, filename_map
+    return barcode_map, filename_map, map_bc_count

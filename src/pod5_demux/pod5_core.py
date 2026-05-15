@@ -14,7 +14,7 @@ def split_one_pod5_by_barcode(
     filename_map: Dict[str, str], 
     output_mode: str, 
     known_bc: Optional[str]
-) -> Dict[str, int]:
+) -> dict:
     """
     Reads a single POD5 file and splits its reads into temporary files 
     based on the provided barcode mapping.
@@ -32,7 +32,7 @@ def split_one_pod5_by_barcode(
     """
     source_name = Path(pod5_file).stem
     writers = {}
-    stats = {"processed": 0, "sorted": 0, "unclassified": 0}
+    stats = {"processed": 0, "sorted": 0, "unclassified": 0, "bc_counts": {}}
     temp_dir = os.path.join(output_dir, "temp_parts")
 
     try:
@@ -44,6 +44,7 @@ def split_one_pod5_by_barcode(
 
                 # If a specific barcode is enforced, skip all other reads
                 if known_bc and bc_name != known_bc:
+                    stats["unclassified"] += 1
                     continue
 
                 # Determine the grouping key for the writer
@@ -68,6 +69,7 @@ def split_one_pod5_by_barcode(
                         stats["sorted"] += 1
                     else: 
                         stats["unclassified"] += 1
+                    stats["bc_counts"][bc_name] = stats["bc_counts"].get(bc_name, 0) + 1
                 except Exception as e:
                     print(f"[Error] Failed to write ID {read_id}: {e}")
     finally:

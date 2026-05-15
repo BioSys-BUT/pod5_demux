@@ -49,7 +49,7 @@ def run_demultiplexing(
     It loads the mapping, splits the POD5 files by barcode, and then merges them.
     """
     start_time = time.perf_counter()
-
+    output_dir = os.path.abspath(output_dir)
     output_dir = ensure_unique_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -59,13 +59,13 @@ def run_demultiplexing(
     print(f"Input map:      {input_seq}")
     print(f"Input POD5:     {input_pod5}")
     print(f"Output folder:  {output_dir}")
-    print(f"Output mode:    {output_mode}")
+    print(f"Output mode:    {output_mode.value}")
     print(f"Thread count:   {n_cores}")
     print("=" * 50)
 
     # LOAD MAP
     try:
-        bc_map, f_map = load_barcode_map_parallel(input_seq, output_mode, known_bc, n_cores)
+        bc_map, f_map, map_stats = load_barcode_map_parallel(input_seq, output_mode, known_bc, n_cores)
     except ValueError as e:
         print(f"Critical error: {e}")
         return
@@ -160,13 +160,77 @@ def run_demultiplexing(
     print(f"Split time:         {process_time - map_time:.2f} seconds")
     print(f"Merge time:         {end_time - process_time:.2f} seconds")
 
-    with open(os.path.join(output_dir, "demux_stats.txt"), "w") as stats_file:
-        stats_file.write(f"Processed reads: {total_reads}\n")
-        stats_file.write(f"Total time: {end_time - start_time:.2f} s\n")
-        stats_file.write(f"Mode: {output_mode.value}\n")
-        stats_file.write(f"Unique barcodes: {len(set(bc_map.values()))}\n")
-        stats_file.write(f"Created files: {len(groups)}\n")
+    # Number of reads per barcode and unclassified
+    bc_counts = {}
+    unclassified_total = 0
+    for r in results:
+        unclassified_total += r["unclassified"]
+        for bc, count in r.get("bc_counts", {}).items():
+            bc_counts[bc] = bc_counts.get(bc, 0) + count
 
+    with open(os.path.join(output_dir, "demux_stats.txt"), "w") as stats_file:
+        stats_file.write("*" * 50 + "\n")
+        stats_file.write(" DEMULTIPLEXING SUMMARY\n")
+        stats_file.write("*" * 50 + "\n")
+        
+        # BASIC PARAMETERS
+        stats_file.write(f"Input map:               {input_seq}\n")
+        stats_file.write(f"Input POD5:              {input_pod5}\n")
+        stats_file.write(f"Output directory:        {output_dir}\n")
+        stats_file.write(f"Output mode:             {output_mode.value}\n")
+        stats_file.write(f"CPU cores:               {n_cores}\n")
+        if known_bc:
+            stats_file.write(f"Target barcode:          {known_bc}\n")
+            
+        stats_file.write("-" * 50 + "\n")
+        
+        # PROCESSING STATS WITH PERCENTAGES
+        stats_file.write(f"Reads loaded from map:   {len(bc_map)} reads\n")
+        stats_file.write(f"Processed reads (POD5):  {total_reads}\n")
+        
+        if total_reads > 0:
+            demux_pct = ((total_reads - unclassified_total) / total_reads) * 100
+            unclass_pct = (unclassified_total / total_reads) * 100
+        else:
+            demux_pct = unclass_pct = 0.0
+
+        if known_bc:
+            written = sum(bc_counts.values())
+            written_pct = (written / total_reads * 100) if total_reads else 0.0
+            stats_file.write(f"Written reads:           {written} ({written_pct:.1f} %)\n")
+            stats_file.write(f"Skipped reads:           {unclassified_total}\n")
+        else:
+            stats_file.write(f"Demultiplexed:           {total_reads - unclassified_total} ({demux_pct:.1f} %)\n")
+            stats_file.write(f"Unclassified:            {unclassified_total} ({unclass_pct:.1f} %)\n")
+            stats_file.write(f"Unique barcodes in map:  {len(set(bc_map.values()))}\n")
+            
+        stats_file.write(f"Files created:           {len(groups)}\n")
+        
+        stats_file.write("-" * 50 + "\n")
+        
+        # TIMING
+        stats_file.write(f"Map loading time:        {map_time - start_time:.2f} s\n")
+        stats_file.write(f"Split time:              {process_time - map_time:.2f} s\n")
+        stats_file.write(f"Merge time:              {end_time - process_time:.2f} s\n")
+        stats_file.write(f"Total processing time:   {end_time - start_time:.2f} s\n")
+        
+        # DETAILED BREAKDOWN (RECOVERY RATE)
+        if bc_counts and not known_bc:
+            stats_file.write("-" * 50 + "\n")
+            stats_file.write("Reads per barcode:\n")
+            for bc, count in sorted(bc_counts.items()):
+                if bc == "unclassified":
+                    stats_file.write(f" {bc}:       {count}\n")
+                    continue
+                
+                map_count = map_stats.get(bc, 0)
+                if map_count > 0:
+                    recovery_pct = (count / map_count) * 100
+                    stats_file.write(f" {bc}:       {count} (out of {map_count} from map -> {recovery_pct:>5.1f} %)\n")
+                else:
+                    stats_file.write(f" {bc}:       {count} (not found in map - anomaly)\n")
+                    
+        stats_file.write("=" * 50 + "\n")
 
 @app.command()
 def main(
@@ -186,7 +250,7 @@ def main(
                                      help="Barcode name to assign to all mapped reads.")] = None,
     mode: Annotated[OutputMode, typer.Option("-m", "--mode", 
                                      help="Mode: 'single_file' or 'folder'.")] = OutputMode.folder,
-    threads: Annotated[Optional[int], typer.Option("-t", "--threads", 
+    threads: Annotated[int, typer.Option("-t", "--threads", 
                                      help="Number of CPU threads used for processing.")] = 8
 ):
     """

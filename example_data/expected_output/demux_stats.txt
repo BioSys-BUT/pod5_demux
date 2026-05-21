@@ -1,0 +1,27 @@
+**************************************************
+ DEMULTIPLEXING SUMMARY
+**************************************************
+Input map:               example_data/map/
+Input POD5:              example_data/pod5
+Output directory:        pod5_demux_output
+Output mode:             folder
+CPU cores:               8
+--------------------------------------------------
+Reads loaded from map:   380
+Processed reads (POD5):  398
+Demultiplexed:           379 (95.2 %)
+Unclassified:            19 (4.8 %)
+Unique barcodes in map:  3
+Files created:           4
+--------------------------------------------------
+Map loading time:        0.10 s
+Split time:              0.26 s
+Merge time:              0.67 s
+Total processing time:   1.03 s
+--------------------------------------------------
+Reads per barcode:
+ barcode01:       127 (out of 127 from map -> 100.0 %)
+ barcode02:       126 (out of 127 from map ->  99.2 %)
+ barcode03:       126 (out of 126 from map -> 100.0 %)
+ unclassified:    19
+==================================================

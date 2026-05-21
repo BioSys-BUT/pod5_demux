@@ -1,28 +1,35 @@
 # src/pod5_demux/utils.py
 import os
+import shutil
 from typing import Tuple
 
-def ensure_unique_dir(path: str) -> str:
+def ensure_unique_dir(path: str, overwrite: bool = False) -> str:
     """
-    Ensures a unique output directory name by appending a number 
-    if the directory already exists.
+    Checks whether the output directory is safe to use.
+    - If it doesn't exist, it's safe.
+    - If it exists but is empty, it's safe.
+    - If it's not empty and overwrite=True, it wipes it clean.
+    - If it's not empty and overwrite=False, raises FileExistsError.
+    """
+    base = os.path.abspath(path.rstrip("/\\"))
     
-    Args:
-        path: The desired directory path.
-        
-    Returns:
-        A unique directory path (e.g., 'dir', 'dir(1)', 'dir(2)').
-    """
-    base = path.rstrip("/\\")
     if not os.path.exists(base):
         return base
-        
-    i = 1
-    while True:
-        candidate = f"{base}({i})"
-        if not os.path.exists(candidate):
-            return candidate
-        i += 1
+
+    # Check if it's a directory and empty   
+    if os.path.isdir(base) and not os.listdir(base):
+        return base
+
+    # Exists and is not empty
+    # If overwrite is True, remove the existing directory and create a new one
+    if overwrite:
+        shutil.rmtree(base, ignore_errors=True)
+        return base
+    # If overwrite is False, raise an error
+    raise FileExistsError(
+        f"Output directory already exists and is NOT empty: '{base}'\n"
+        f"  Use --overwrite to clear it automatically, or choose a different --output path."
+    )
 
 def detect_format(input_path: str) -> Tuple[str, str]:
     """

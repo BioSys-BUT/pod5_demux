@@ -42,7 +42,8 @@ def run_demultiplexing(
     output_dir: str, 
     known_bc: Optional[str], 
     output_mode: OutputMode, 
-    n_cores: int
+    n_cores: int,
+    overwrite: bool = False,
 ):
     """
     Core function that orchestrates the entire demultiplexing workflow.
@@ -50,7 +51,11 @@ def run_demultiplexing(
     """
     start_time = time.perf_counter()
     output_dir = os.path.abspath(output_dir)
-    output_dir = ensure_unique_dir(output_dir)
+    try:
+        output_dir = ensure_unique_dir(output_dir, overwrite=overwrite)
+    except FileExistsError as e:
+        print(f"!!! {e}")
+        raise typer.Exit(code=1)
     os.makedirs(output_dir, exist_ok=True)
 
     print("*" * 50)
@@ -73,6 +78,20 @@ def run_demultiplexing(
     if not bc_map:
         print("!!! Process terminated: No barcodes found in mapping files.")
         return
+
+    # Validate --bc: check that the requested barcode actually exists in the map
+    if known_bc:
+        found_barcodes = set(bc_map.values())
+        if known_bc not in found_barcodes:
+            print(f"!!! Process terminated: Barcode '{known_bc}' was not found in the mapping files.")
+            print(f"    Available barcodes: {', '.join(sorted(found_barcodes))}")
+            raise typer.Exit(code=1)
+            
+        # filter out unused barcodes from map and filename mapping for cleaner processing and reporting
+        bc_map = {rid: bc for rid, bc in bc_map.items() if bc == known_bc}
+        f_map = {rid: fn for rid, fn in f_map.items() if rid in bc_map}
+        # filter out unused barcodes from stats for cleaner reporting
+        map_stats = {bc: cnt for bc, cnt in map_stats.items() if bc == known_bc}
 
     map_time = time.perf_counter()
     print(f"-> Map loaded: {len(bc_map)} IDs (time: {map_time - start_time:.2f} s)")
@@ -185,7 +204,7 @@ def run_demultiplexing(
         stats_file.write("-" * 50 + "\n")
         
         # PROCESSING STATS WITH PERCENTAGES
-        stats_file.write(f"Reads loaded from map:   {len(bc_map)} reads\n")
+        stats_file.write(f"Reads loaded from map:   {len(bc_map)}\n")
         stats_file.write(f"Processed reads (POD5):  {total_reads}\n")
         
         if total_reads > 0:
@@ -238,22 +257,24 @@ def main(
                                      exists=True,
                                      resolve_path=True,
                                      readable=True,
-                                     help="Path to the reference map (BAM/SAM/FASTQ).")],
+                                     help="Path to the mapping file or directory (BAM/SAM/FASTQ).")],
     pod5_path: Annotated[str, typer.Option("-p", "--pod5",
                                      exists=True,
                                      resolve_path=True,
                                      readable=True,
                                      help="Path to the POD5 data.")],
     output: Annotated[str, typer.Option("-o", "--output", 
-                                     help="Output directory. (Default: 'pod5_demux_output')")] = "pod5_demux_output",
+                                     help="Output directory.")] = "pod5_demux_output",
     known_bc: Annotated[Optional[str], typer.Option("-b", "--bc", 
-                                     help="Barcode name to assign to all mapped reads.")] = None,
+                                     help="Filter output to this barcode only (e.g. barcode05). Also used as fallback assignment for unannotated files.")] = None,
     mode: Annotated[OutputMode, typer.Option("-m", "--mode", 
                                      help="Mode: 'single_file' or 'folder'.")] = OutputMode.folder,
     threads: Annotated[int, typer.Option("-t", "--threads", 
-                                     help="Number of CPU threads used for processing.")] = 8
+                                     help="Number of CPU threads used for processing.")] = 8,
+    overwrite: Annotated[bool, typer.Option("--overwrite",
+                                     help="Automatically delete and recreate the output directory if it already exists and is not empty.")] = False,
 ):
     """
     Starts the demultiplexing process.
     """
-    run_demultiplexing(seq, pod5_path, output, known_bc, mode, threads)
+    run_demultiplexing(seq, pod5_path, output, known_bc, mode, threads, overwrite)

@@ -37,7 +37,7 @@ _BAM_RECORD_HEADER = struct.Struct('<4s4sBBHHHI4s4s4s')  # 32 bytes
  
  
 # ---------------------------------------------------------------------------
-# BGZF Decompression — SAMv1 Section 4.1
+# BGZF Decompression - SAMv1 Section 4.1
 # ---------------------------------------------------------------------------
  
 def _read_bgzf_blocks(file_path: str) -> bytes:
@@ -91,10 +91,10 @@ def _read_bgzf_blocks(file_path: str) -> bytes:
  
  
 # ---------------------------------------------------------------------------
-# Custom BAM Parser — reads only read_id and BC/RG tags
+# Custom BAM Parser - reads only read_id and BC/RG tags
 # ---------------------------------------------------------------------------
  
-def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str, known_bc: Optional[str]) -> Tuple[Dict, Dict]:
+def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str, forced_bc: Optional[str], known_bc: Optional[str]) -> Tuple[Dict, Dict]:
     """
     Reads a BAM file without the pysam dependency. 
     Extracts only the UUID (read_name) and the BC or RG optional tags.
@@ -139,18 +139,17 @@ def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str,
             # Unpack the 32-byte fixed portion
             _, _, l_read_name, _, _, n_cigar_op, _, l_seq, _, _, _ = _BAM_RECORD_HEADER.unpack(block[:32])
  
-            # read_name (UUID) — without the trailing NUL byte
+            # read_name (UUID) - without the trailing NUL byte
             read_id = block[32: 32 + l_read_name - 1].decode('ascii', errors='replace')
 
-            if known_bc:
-                found_bc = known_bc
+            if forced_bc:
+                found_bc = forced_bc
             else:
-                # Offset where optional tags begin:
-                # 32 (fixed) + l_read_name + n_cigar_op×4 + (l_seq+1)//2 + l_seq
                 tag_offset = 32 + l_read_name + n_cigar_op * 4 + (l_seq + 1) // 2 + l_seq
-    
-                # Parse optional tags (SAMv1 Section 4.2.4)
                 found_bc = _extract_bc_tag(block, tag_offset)
+                
+                if not found_bc and known_bc:
+                    found_bc = known_bc # 3. krok: Fallback
  
             if found_bc:
                 mapping[read_id] = found_bc
@@ -218,12 +217,12 @@ def _extract_bc_tag(block: bytes, offset: int) -> str|None:
             i += 5 + count * size
  
         else:
-            break  # Unknown type encountered — stop parsing
+            break  # Unknown type encountered - stop parsing
  
     return rg_val  # BC not found, return RG (or None)
 
 
-def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, known_bc: Optional[str]) -> Tuple[Dict, Dict, Dict]:
+def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, forced_bc: Optional[str], known_bc: Optional[str]) -> Tuple[Dict, Dict, Dict]:
     """
     Parses a single sequence mapping file (BAM, SAM, or FASTQ) and extracts 
     read-to-barcode mappings. Automatically falls back to custom parsers 
@@ -239,7 +238,7 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
 
     if file_type in ["sam", "bam"]:
         if not PYSAM_AVAILABLE and file_type == "bam":
-            mapping, filename_map = _parse_bam_without_pysam(file_path, is_fmap, clean_filename, known_bc)
+            mapping, filename_map = _parse_bam_without_pysam(file_path, is_fmap, clean_filename, forced_bc, known_bc)
             
         elif not PYSAM_AVAILABLE and file_type == "sam":
             with open(file_path, 'r') as f:
@@ -253,8 +252,8 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
                     read_id = parts[0]
                     found_bc = None
                     
-                    if known_bc:
-                        found_bc = known_bc
+                    if forced_bc:
+                        found_bc = forced_bc
                     else:
                         # Search optional fields for BC or RG tags
                         for field in parts[11:]:
@@ -264,6 +263,10 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
                             elif field.startswith("RG:Z:"):
                                 match = BARCODE_RE.search(field)
                                 found_bc = match.group() if match else field
+                                break
+                                
+                        if not found_bc and known_bc:
+                            found_bc = known_bc # 3. krok: Fallback
                     if found_bc:
                         mapping[read_id] = found_bc
                         if is_fmap: 
@@ -275,8 +278,8 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
                 with pysam.AlignmentFile(file_path, mode, check_sq=False) as samfile:
                     for read in samfile.fetch(until_eof=True):
                         read_id = read.query_name
-                        if known_bc:
-                            bc = known_bc
+                        if forced_bc:
+                            bc = forced_bc
                         else:
                             try:
                                 bc = read.get_tag("BC")
@@ -286,7 +289,7 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
                                     match = BARCODE_RE.search(str(rg))
                                     bc = match.group() if match else str(rg)
                                 except KeyError:
-                                    bc = None
+                                    bc = known_bc # 3. krok: Fallback
                         if bc:
                             mapping[read_id] = bc
                             if is_fmap: 
@@ -301,12 +304,14 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
         try:
             with open_func(file_path, mode) as handle:
                 for record in SeqIO.parse(handle, "fastq"):
-                    if known_bc:
-                        mapping[record.id] = known_bc
+                    if forced_bc:
+                        mapping[record.id] = forced_bc
                     else:
                         match = BARCODE_RE.search(record.description)
                         if match:
                             mapping[record.id] = match.group()
+                        elif known_bc:
+                            mapping[record.id] = known_bc # 3. krok: Fallback
                     if is_fmap: 
                         filename_map[record.id] = clean_filename
         except Exception as e:
@@ -316,10 +321,38 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, kno
         map_bc_count[bc] = map_bc_count.get(bc, 0) + 1
     return mapping, filename_map, map_bc_count
 
+def _detect_bc_from_path(input_path: str) -> Optional[str]:
+    """
+    Tries to detect a barcode name from the input path.
+    
+    Handles two cases:
+      1. The path is a directory named barcodeXX   → e.g. /data/fastq/barcode05/
+      2. The path is a file named barcodeXX.fastq  → e.g. /data/fastq/barcode05.fastq
+    
+    Returns the detected barcode string (e.g. 'barcode05') or None.
+    """
+    p = Path(input_path)
+    # Check directory name or file stem
+    name = p.name if p.is_dir() else p.stem
+    # Strip .fastq from double-extension files like barcode05.fastq.gz
+    name = name.replace(".fastq", "")
+    match = BARCODE_RE.fullmatch(name)
+    return match.group() if match else None
+
+
 def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Optional[str], n_cores: int) -> Tuple[Dict, Dict, Dict]:
     """
     Locates mapping files in the input path and constructs a large 
     lookup dictionary in parallel using multiple CPU cores.
+
+    Barcode assignment priority:
+      1. Barcode annotation in the file itself (BC/RG tag in BAM/SAM, header in FASTQ)
+      2. Auto-detected from folder or file name (e.g. barcode05/ or barcode05.fastq)
+      3. Explicit --bc value supplied by the user (fallback for unannotated files
+         whose name does not follow the barcodeXX convention)
+
+    The known_bc parameter is used ONLY as a filter on the output - reads that were
+    assigned a different barcode are excluded from the result.
     """
     is_fmap = (output_format == "folder")
     input_format, path_type = detect_format(input_path)
@@ -335,18 +368,33 @@ def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Opt
 
     print(f"-> Found {len(files)} mapping files ({input_format.upper()}). Loading in parallel...")
 
+    # Per-file barcode assignment:
+    #   - For each file, try to detect barcodeXX from its parent folder name or its own name.
+    #   - If detected, pass that as forced_bc to the parser (overrides in-file annotations
+    #     which are absent for unannotated FASTQ).
+    #   - If not detected, pass known_bc as fallback (user explicitly told us the barcode).
+    #   - If neither is available, the parser tries to read annotations from the file itself.
+    def make_worker_args(file_path):
+        path_bc = _detect_bc_from_path(file_path)
+        if not path_bc:
+            # Also check the immediate parent directory
+            path_bc = _detect_bc_from_path(str(Path(file_path).parent))
+        
+        # Předáváme path_bc jako explicitní forced_bc a known_bc jako fallback zvlášť
+        return (file_path, input_format, is_fmap, path_bc, known_bc)
+
+    worker_args = [make_worker_args(f) for f in files]
+
     barcode_map = {}
     filename_map = {}
     map_bc_count = {}
-    
-    worker = partial(parse_single_mapping_file, file_type=input_format, is_fmap=is_fmap, known_bc=known_bc)
-    
+
     with Pool(processes=n_cores) as pool:
-        results = pool.map(worker, files)
+        results = pool.starmap(parse_single_mapping_file, worker_args)
         for m, fm, bc_count in results:
             barcode_map.update(m)
             filename_map.update(fm)
             for bc, count in bc_count.items():
                 map_bc_count[bc] = map_bc_count.get(bc, 0) + count
-            
+
     return barcode_map, filename_map, map_bc_count

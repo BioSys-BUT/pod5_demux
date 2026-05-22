@@ -262,6 +262,8 @@ Reads per barcode:
 
 ## Example Dataset
 
+> **Note:** If you installed the package directly via `pip install git+https...`, the test dataset is not downloaded to your system automatically. To access the example data and run these tests, please clone or download the repository manually from GitHub.
+
 A small example dataset is included in the `example_data/` directory in the repository root. It contains reads from a real Promethion run, split across 3 barcodes and 2 POD5 files, and can be used to verify that the tool is working correctly after installation.
 
 ### Structure

@@ -43,8 +43,8 @@ _BAM_RECORD_HEADER = struct.Struct('<4s4sBBHHHI4s4s4s')  # 32 bytes
 def _read_bgzf_blocks(file_path: str) -> bytes:
     """
     Decompresses a BGZF file into a single bytearray.
- 
-    According to SAMv1 Section 4.1: A BGZF file is a series of gzip blocks, 
+
+    According to SAMv1 Section 4.1: A BGZF file is a series of gzip blocks,
     each containing an extra field with BSIZE (total block size - 1).
     Data is compressed using raw deflate (zlib without gzip header).
     EOF is signaled by an empty block with ISIZE == 0.
@@ -93,12 +93,23 @@ def _read_bgzf_blocks(file_path: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Custom BAM Parser - reads only read_id and BC/RG tags
 # ---------------------------------------------------------------------------
- 
-def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str, forced_bc: Optional[str], known_bc: Optional[str]) -> Tuple[Dict, Dict]:
+
+def _parse_bam_without_pysam(
+    file_path: str,
+    is_fmap: bool,
+    clean_filename: str,
+    path_bc: Optional[str],
+    known_bc: Optional[str],
+) -> Tuple[Dict, Dict]:
     """
     Reads a BAM file without the pysam dependency. 
     Extracts only the UUID (read_name) and the BC or RG optional tags.
- 
+
+    Barcode assignment priority per record:
+      1. BC or RG tag found inside the record itself
+      2. path_bc  – barcode inferred from the file/folder name
+      3. known_bc – explicit fallback supplied by the user via --bc
+
     BAM record structure (SAMv1 Section 4.2):
       32B             Fixed header (refID, pos, l_read_name, mapq, bin,
                                     n_cigar_op, flag, l_seq, next_refID, next_pos, tlen)
@@ -142,15 +153,18 @@ def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str,
             # read_name (UUID) - without the trailing NUL byte
             read_id = block[32: 32 + l_read_name - 1].decode('ascii', errors='replace')
 
-            if forced_bc:
-                found_bc = forced_bc
-            else:
-                tag_offset = 32 + l_read_name + n_cigar_op * 4 + (l_seq + 1) // 2 + l_seq
-                found_bc = _extract_bc_tag(block, tag_offset)
-                
-                if not found_bc and known_bc:
-                    found_bc = known_bc # 3. krok: Fallback
- 
+            # Priority 1: annotation inside the record (BC / RG tags)
+            tag_offset = 32 + l_read_name + n_cigar_op * 4 + (l_seq + 1) // 2 + l_seq
+            found_bc = _extract_bc_tag(block, tag_offset)
+
+            # Priority 2: barcode inferred from the file/folder name
+            if not found_bc:
+                found_bc = path_bc
+
+            # Priority 3: explicit user fallback
+            if not found_bc:
+                found_bc = known_bc
+
             if found_bc:
                 mapping[read_id] = found_bc
                 if is_fmap:
@@ -160,9 +174,9 @@ def _parse_bam_without_pysam(file_path: str, is_fmap: bool, clean_filename: str,
         print(f'[Error] Failed to read BAM (custom parser) {file_path}: {e}')
  
     return mapping, filename_map
- 
- 
-def _extract_bc_tag(block: bytes, offset: int) -> str|None:
+
+
+def _extract_bc_tag(block: bytes, offset: int) -> Optional[str]:
     """
     Iterates through the optional tags of a BAM record and returns the 
     value of the BC (Barcode) or RG (Read Group) tag.
@@ -222,11 +236,22 @@ def _extract_bc_tag(block: bytes, offset: int) -> str|None:
     return rg_val  # BC not found, return RG (or None)
 
 
-def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, forced_bc: Optional[str], known_bc: Optional[str]) -> Tuple[Dict, Dict, Dict]:
+def parse_single_mapping_file(
+    file_path: str,
+    file_type: str,
+    is_fmap: bool,
+    path_bc: Optional[str],
+    known_bc: Optional[str],
+) -> Tuple[Dict, Dict, Dict]:
     """
     Parses a single sequence mapping file (BAM, SAM, or FASTQ) and extracts 
     read-to-barcode mappings. Automatically falls back to custom parsers 
     if pysam is unavailable.
+
+    Barcode assignment priority (applied per read):
+      1. Annotation inside the file   (BC/RG tag in BAM/SAM; barcode in FASTQ header)
+      2. Barcode inferred from path   (file or parent directory named barcodeXX)
+      3. Explicit user fallback       (--bc / known_bc)
     """
     mapping = {}
     filename_map = {}
@@ -238,8 +263,10 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, for
 
     if file_type in ["sam", "bam"]:
         if not PYSAM_AVAILABLE and file_type == "bam":
-            mapping, filename_map = _parse_bam_without_pysam(file_path, is_fmap, clean_filename, forced_bc, known_bc)
-            
+            mapping, filename_map = _parse_bam_without_pysam(
+                file_path, is_fmap, clean_filename, path_bc, known_bc
+            )
+
         elif not PYSAM_AVAILABLE and file_type == "sam":
             with open(file_path, 'r') as f:
                 for line in f:
@@ -250,27 +277,31 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, for
                         continue
                     
                     read_id = parts[0]
+
+                    # Priority 1: annotation inside the record
                     found_bc = None
-                    
-                    if forced_bc:
-                        found_bc = forced_bc
-                    else:
-                        # Search optional fields for BC or RG tags
-                        for field in parts[11:]:
-                            if field.startswith("BC:Z:"):
-                                found_bc = field.split(":")[2].strip()
-                                break
-                            elif field.startswith("RG:Z:"):
-                                match = BARCODE_RE.search(field)
-                                found_bc = match.group() if match else field
-                                break
-                                
-                        if not found_bc and known_bc:
-                            found_bc = known_bc # 3. krok: Fallback
+                    for field in parts[11:]:
+                        if field.startswith("BC:Z:"):
+                            found_bc = field.split(":")[2].strip()
+                            break
+                        elif field.startswith("RG:Z:"):
+                            match = BARCODE_RE.search(field)
+                            found_bc = match.group() if match else field.split(":")[2].strip()
+                            break
+
+                    # Priority 2: inferred from file/folder name
+                    if not found_bc:
+                        found_bc = path_bc
+
+                    # Priority 3: explicit user fallback
+                    if not found_bc:
+                        found_bc = known_bc
+
                     if found_bc:
                         mapping[read_id] = found_bc
-                        if is_fmap: 
+                        if is_fmap:
                             filename_map[read_id] = clean_filename
+
         else:
             # Parse using pysam if available
             mode = "rb" if file_type == "bam" else "r"
@@ -278,48 +309,68 @@ def parse_single_mapping_file(file_path: str, file_type: str, is_fmap: bool, for
                 with pysam.AlignmentFile(file_path, mode, check_sq=False) as samfile:
                     for read in samfile.fetch(until_eof=True):
                         read_id = read.query_name
-                        if forced_bc:
-                            bc = forced_bc
-                        else:
+
+                        # Priority 1: annotation inside the record
+                        found_bc = None
+                        try:
+                            found_bc = read.get_tag("BC")
+                        except KeyError:
                             try:
-                                bc = read.get_tag("BC")
+                                rg = read.get_tag("RG")
+                                match = BARCODE_RE.search(str(rg))
+                                found_bc = match.group() if match else str(rg)
                             except KeyError:
-                                try:
-                                    rg = read.get_tag("RG")
-                                    match = BARCODE_RE.search(str(rg))
-                                    bc = match.group() if match else str(rg)
-                                except KeyError:
-                                    bc = known_bc # 3. krok: Fallback
-                        if bc:
-                            mapping[read_id] = bc
-                            if is_fmap: 
+                                pass
+
+                        # Priority 2: inferred from file/folder name
+                        if not found_bc:
+                            found_bc = path_bc
+
+                        # Priority 3: explicit user fallback
+                        if not found_bc:
+                            found_bc = known_bc
+
+                        if found_bc:
+                            mapping[read_id] = found_bc
+                            if is_fmap:
                                 filename_map[read_id] = clean_filename
+
             except Exception as e:
                 print(f"[Error] Failed to read BAM/SAM with pysam {file_path}: {e}")
 
     elif file_type == "fastq":
-        # Handle both gzipped and plain FASTQ files
         open_func = gzip.open if file_path.endswith('.gz') else open
         mode = "rt" if file_path.endswith('.gz') else "r"
         try:
             with open_func(file_path, mode) as handle:
                 for record in SeqIO.parse(handle, "fastq"):
-                    if forced_bc:
-                        mapping[record.id] = forced_bc
-                    else:
-                        match = BARCODE_RE.search(record.description)
-                        if match:
-                            mapping[record.id] = match.group()
-                        elif known_bc:
-                            mapping[record.id] = known_bc # 3. krok: Fallback
-                    if is_fmap: 
-                        filename_map[record.id] = clean_filename
+                    # Priority 1: barcode in the FASTQ header
+                    found_bc = None
+                    match = BARCODE_RE.search(record.description)
+                    if match:
+                        found_bc = match.group()
+
+                    # Priority 2: inferred from file/folder name
+                    if not found_bc:
+                        found_bc = path_bc
+
+                    # Priority 3: explicit user fallback
+                    if not found_bc:
+                        found_bc = known_bc
+
+                    if found_bc:
+                        mapping[record.id] = found_bc
+                        if is_fmap:
+                            filename_map[record.id] = clean_filename
+
         except Exception as e:
             print(f"[Error] Failed to read FASTQ {file_path}: {e}")
 
     for bc in mapping.values():
         map_bc_count[bc] = map_bc_count.get(bc, 0) + 1
+
     return mapping, filename_map, map_bc_count
+
 
 def _detect_bc_from_path(input_path: str) -> Optional[str]:
     """
@@ -340,19 +391,23 @@ def _detect_bc_from_path(input_path: str) -> Optional[str]:
     return match.group() if match else None
 
 
-def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Optional[str], n_cores: int) -> Tuple[Dict, Dict, Dict]:
+def load_barcode_map_parallel(
+    input_path: str,
+    output_format: str,
+    known_bc: Optional[str],
+    n_cores: int,
+) -> Tuple[Dict, Dict, Dict]:
     """
     Locates mapping files in the input path and constructs a large 
     lookup dictionary in parallel using multiple CPU cores.
 
-    Barcode assignment priority:
-      1. Barcode annotation in the file itself (BC/RG tag in BAM/SAM, header in FASTQ)
-      2. Auto-detected from folder or file name (e.g. barcode05/ or barcode05.fastq)
-      3. Explicit --bc value supplied by the user (fallback for unannotated files
-         whose name does not follow the barcodeXX convention)
+    Barcode assignment priority (applied per read, inside each worker):
+      1. Annotation inside the file   (BC/RG tag in BAM/SAM; barcode in FASTQ header)
+      2. Barcode inferred from path   (file or parent directory named barcodeXX)
+      3. Explicit user fallback       (--bc / known_bc)
 
-    The known_bc parameter is used ONLY as a filter on the output - reads that were
-    assigned a different barcode are excluded from the result.
+    The known_bc parameter also acts as an output filter after the map is built:
+    reads assigned to any other barcode are removed from the result.
     """
     is_fmap = (output_format == "folder")
     input_format, path_type = detect_format(input_path)
@@ -368,19 +423,19 @@ def load_barcode_map_parallel(input_path: str, output_format: str, known_bc: Opt
 
     print(f"-> Found {len(files)} mapping files ({input_format.upper()}). Loading in parallel...")
 
-    # Per-file barcode assignment:
-    #   - For each file, try to detect barcodeXX from its parent folder name or its own name.
-    #   - If detected, pass that as forced_bc to the parser (overrides in-file annotations
-    #     which are absent for unannotated FASTQ).
-    #   - If not detected, pass known_bc as fallback (user explicitly told us the barcode).
-    #   - If neither is available, the parser tries to read annotations from the file itself.
-    def make_worker_args(file_path):
+    def make_worker_args(file_path: str) -> tuple:
+        """
+        Build the argument tuple for parse_single_mapping_file.
+
+        path_bc is detected from the file itself or its parent directory.
+        known_bc is passed separately and used only as a last resort inside
+        the worker — it is never promoted to override in-file annotations.
+        """
         path_bc = _detect_bc_from_path(file_path)
         if not path_bc:
             # Also check the immediate parent directory
             path_bc = _detect_bc_from_path(str(Path(file_path).parent))
-        
-        # Předáváme path_bc jako explicitní forced_bc a known_bc jako fallback zvlášť
+
         return (file_path, input_format, is_fmap, path_bc, known_bc)
 
     worker_args = [make_worker_args(f) for f in files]

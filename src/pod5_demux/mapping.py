@@ -106,7 +106,7 @@ def _parse_bam_without_pysam(
     Extracts only the UUID (read_name) and the BC or RG optional tags.
 
     Barcode assignment priority per record:
-      1. BC or RG tag found inside the record itself
+      1. BC tag, or RG tag only if its value matches 'barcodeXX'
       2. path_bc  – barcode inferred from the file/folder name
       3. known_bc – explicit fallback supplied by the user via --bc
 
@@ -180,6 +180,11 @@ def _extract_bc_tag(block: bytes, offset: int) -> Optional[str]:
     """
     Iterates through the optional tags of a BAM record and returns the 
     value of the BC (Barcode) or RG (Read Group) tag.
+
+    For RG tags, only values matching the pattern 'barcodeXX' are accepted.
+    If the RG value does not match (e.g. a run-ID string like
+    '33cbe55b_..._unclassified'), None is returned so the read falls through
+    to path_bc / known_bc instead of creating a spurious output folder.
  
     Optional tag structure (SAMv1 Section 4.2.4):
       2B  tag name (e.g., b'BC')
@@ -221,7 +226,7 @@ def _extract_bc_tag(block: bytes, offset: int) -> Optional[str]:
                 return val
             elif tag == b'RG' and rg_val is None:
                 match = BARCODE_RE.search(val)
-                rg_val = match.group() if match else val
+                rg_val = match.group() if match else None
  
         elif val_type == b'B':
             # Array of values: sub-type(1B) + count(4B) + count×size elements
@@ -249,7 +254,8 @@ def parse_single_mapping_file(
     if pysam is unavailable.
 
     Barcode assignment priority (applied per read):
-      1. Annotation inside the file   (BC/RG tag in BAM/SAM; barcode in FASTQ header)
+      1. Annotation inside the file   (BC tag, or RG tag only if it matches
+                                       'barcodeXX'; barcode in FASTQ header)
       2. Barcode inferred from path   (file or parent directory named barcodeXX)
       3. Explicit user fallback       (--bc / known_bc)
     """
@@ -286,7 +292,7 @@ def parse_single_mapping_file(
                             break
                         elif field.startswith("RG:Z:"):
                             match = BARCODE_RE.search(field)
-                            found_bc = match.group() if match else field.split(":")[2].strip()
+                            found_bc = match.group() if match else None
                             break
 
                     # Priority 2: inferred from file/folder name
@@ -318,7 +324,7 @@ def parse_single_mapping_file(
                             try:
                                 rg = read.get_tag("RG")
                                 match = BARCODE_RE.search(str(rg))
-                                found_bc = match.group() if match else str(rg)
+                                found_bc = match.group() if match else None
                             except KeyError:
                                 pass
 

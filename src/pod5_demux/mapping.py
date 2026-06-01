@@ -69,7 +69,6 @@ def _read_bgzf_blocks(file_path: str) -> bytes:
             bsize = struct.unpack('<H', f.read(2))[0]
  
             # Compressed data size: BSIZE+1 - 18(header) - 2(BSIZE field) - 8(CRC32+ISIZE)
-            # = BSIZE - XLEN - 19 (SAMv1 Section 4.1: CDATA = BSIZE-XLEN-19)
             cdata = f.read(bsize - XLEN - 19)
             crc32, isize = _BGZF_TAIL.unpack(f.read(8))
  
@@ -77,8 +76,7 @@ def _read_bgzf_blocks(file_path: str) -> bytes:
             if isize == 0:
                 break
  
-            # Raw deflate decompression: zlib.decompressobj(-15) bypasses gzip header
-            # This is the same approach used by htslib and bamnostic
+            # Raw deflate decompression
             data = zlib.decompressobj(-15).decompress(cdata)
  
             # Integrity check
@@ -102,22 +100,16 @@ def _parse_bam_without_pysam(
     known_bc: Optional[str],
 ) -> Tuple[Dict, Dict]:
     """
-    Reads a BAM file without the pysam dependency. 
+    Reads a BAM file without the pysam dependency.
     Extracts only the UUID (read_name) and the BC or RG optional tags.
 
     Barcode assignment priority per record:
-      1. BC tag, or RG tag only if its value matches 'barcodeXX'
-      2. path_bc  – barcode inferred from the file/folder name
-      3. known_bc – explicit fallback supplied by the user via --bc
-
-    BAM record structure (SAMv1 Section 4.2):
-      32B             Fixed header (refID, pos, l_read_name, mapq, bin,
-                                    n_cigar_op, flag, l_seq, next_refID, next_pos, tlen)
-      l_read_name B   read_name (NUL-terminated)
-      n_cigar_op×4 B  cigar     ← skipped
-      (l_seq+1)//2 B  seq       ← skipped
-      l_seq B         qual      ← skipped
-      optional tags   BC, RG    ← extracted
+      1. BC tag (if value matches barcodeXX), or RG tag only if it matches barcodeXX
+         If BC/RG tag exists but does NOT match barcodeXX (e.g. 'unclassified'),
+         the read is treated as explicitly unclassified and known_bc is NOT applied.
+      2. path_bc  - barcode inferred from the file/folder name
+      3. known_bc - explicit fallback supplied by the user via --bc
+                    (only applied when no BC/RG tag was present at all)
     """
     mapping = {}
     filename_map = {}
@@ -130,12 +122,12 @@ def _parse_bam_without_pysam(
             raise ValueError('Invalid BAM magic bytes.')
  
         l_text = struct.unpack('<I', buf.read(4))[0]
-        buf.read(l_text)  # Plain-text SAM header
+        buf.read(l_text)
  
         n_ref = struct.unpack('<I', buf.read(4))[0]
         for _ in range(n_ref):
             l_name = struct.unpack('<I', buf.read(4))[0]
-            buf.read(l_name + 4)  # Reference name + length
+            buf.read(l_name + 4)
  
         # --- Alignment Records ---
         while True:
@@ -147,22 +139,21 @@ def _parse_bam_without_pysam(
             if len(block) < block_size:
                 break
  
-            # Unpack the 32-byte fixed portion
             _, _, l_read_name, _, _, n_cigar_op, _, l_seq, _, _, _ = _BAM_RECORD_HEADER.unpack(block[:32])
- 
-            # read_name (UUID) - without the trailing NUL byte
             read_id = block[32: 32 + l_read_name - 1].decode('ascii', errors='replace')
 
-            # Priority 1: annotation inside the record (BC / RG tags)
             tag_offset = 32 + l_read_name + n_cigar_op * 4 + (l_seq + 1) // 2 + l_seq
-            found_bc = _extract_bc_tag(block, tag_offset)
+            found_bc, tag_present = _extract_bc_tag(block, tag_offset)
 
-            # Priority 2: barcode inferred from the file/folder name
+            # Priority 2: barcode inferred from file/folder name
             if not found_bc:
                 found_bc = path_bc
 
-            # Priority 3: explicit user fallback
-            if not found_bc:
+            # Priority 3: known_bc fallback — only if no BC/RG tag was present at all.
+            # If a tag existed but didn't match barcodeXX (e.g. "unclassified"),
+            # tag_present=True and we do NOT apply the fallback, to avoid incorrectly
+            # assigning unclassified reads to the target barcode.
+            if not found_bc and not tag_present:
                 found_bc = known_bc
 
             if found_bc:
@@ -176,26 +167,26 @@ def _parse_bam_without_pysam(
     return mapping, filename_map
 
 
-def _extract_bc_tag(block: bytes, offset: int) -> Optional[str]:
+def _extract_bc_tag(block: bytes, offset: int) -> Tuple[Optional[str], bool]:
     """
-    Iterates through the optional tags of a BAM record and returns the 
+    Iterates through the optional tags of a BAM record and returns the
     value of the BC (Barcode) or RG (Read Group) tag.
 
-    For RG tags, only values matching the pattern 'barcodeXX' are accepted.
-    If the RG value does not match (e.g. a run-ID string like
-    '33cbe55b_..._unclassified'), None is returned so the read falls through
-    to path_bc / known_bc instead of creating a spurious output folder.
- 
-    Optional tag structure (SAMv1 Section 4.2.4):
-      2B  tag name (e.g., b'BC')
-      1B  val_type ('A','c','C','s','S','i','I','f','Z','H','B')
-      xB  value (length depends on val_type)
+    Returns a tuple (barcode, tag_present):
+      - barcode: the matched barcodeXX string, or None if no match
+      - tag_present: True if a BC or RG tag was found in the record
+                     (even if its value did not match barcodeXX).
+                     Used by the caller to distinguish "no tag" from
+                     "tag present but unclassified", so that known_bc
+                     is not applied to explicitly unclassified reads.
+
+    For RG tags, only values matching 'barcodeXX' are accepted.
     """
-    # Byte sizes for fixed-length numeric tag types 
     TAG_VALUE_SIZES = {b'A': 1, b'c': 1, b'C': 1, b's': 2, b'S': 2,
                        b'i': 4, b'I': 4, b'f': 4}
  
     rg_val = None
+    tag_present = False
     i = offset
  
     while i < len(block) - 2:
@@ -207,38 +198,43 @@ def _extract_bc_tag(block: bytes, offset: int) -> Optional[str]:
             size = TAG_VALUE_SIZES[val_type]
             val = block[i:i+size]
             i += size
- 
             if tag in (b'BC', b'RG'):
-                # Numeric types (unlikely for BC/RG, but handled safely)
                 decoded = val.decode('ascii', errors='replace').rstrip('\x00')
+                tag_present = True
                 if tag == b'BC':
-                    return decoded
+                    match = BARCODE_RE.search(decoded)
+                    if match:
+                        return match.group(), True
                 elif tag == b'RG':
-                    rg_val = decoded
+                    match = BARCODE_RE.search(decoded)
+                    rg_val = match.group() if match else None
  
         elif val_type in (b'Z', b'H'):
-            # NUL-terminated string
             end = block.index(b'\x00', i)
             val = block[i:end].decode('ascii', errors='replace')
             i = end + 1
- 
             if tag == b'BC':
-                return val
+                tag_present = True
+                match = BARCODE_RE.search(val)
+                if match:
+                    return match.group(), True
+                # BC tag present but value doesn't match barcodeXX (e.g. "unclassified")
+                return None, True
             elif tag == b'RG' and rg_val is None:
+                tag_present = True
                 match = BARCODE_RE.search(val)
                 rg_val = match.group() if match else None
  
         elif val_type == b'B':
-            # Array of values: sub-type(1B) + count(4B) + count×size elements
             sub_type = block[i:i+1]
             count    = struct.unpack('<I', block[i+1:i+5])[0]
             size     = TAG_VALUE_SIZES.get(sub_type, 1)
             i += 5 + count * size
  
         else:
-            break  # Unknown type encountered - stop parsing
+            break
  
-    return rg_val  # BC not found, return RG (or None)
+    return rg_val, tag_present
 
 
 def parse_single_mapping_file(
@@ -249,15 +245,17 @@ def parse_single_mapping_file(
     known_bc: Optional[str],
 ) -> Tuple[Dict, Dict, Dict]:
     """
-    Parses a single sequence mapping file (BAM, SAM, or FASTQ) and extracts 
-    read-to-barcode mappings. Automatically falls back to custom parsers 
+    Parses a single sequence mapping file (BAM, SAM, or FASTQ) and extracts
+    read-to-barcode mappings. Automatically falls back to custom parsers
     if pysam is unavailable.
 
     Barcode assignment priority (applied per read):
-      1. Annotation inside the file   (BC tag, or RG tag only if it matches
-                                       'barcodeXX'; barcode in FASTQ header)
-      2. Barcode inferred from path   (file or parent directory named barcodeXX)
-      3. Explicit user fallback       (--bc / known_bc)
+      1. Annotation inside the file (BC tag, or RG tag only if it matches
+         barcodeXX; barcode in FASTQ header).
+         If a BC/RG tag exists but does not match barcodeXX (e.g. "unclassified"),
+         the read is treated as explicitly unclassified and known_bc is NOT applied.
+      2. Barcode inferred from path (file or parent directory named barcodeXX)
+      3. Explicit user fallback (--bc / known_bc) — only when no tag was present
     """
     mapping = {}
     filename_map = {}
@@ -276,31 +274,32 @@ def parse_single_mapping_file(
         elif not PYSAM_AVAILABLE and file_type == "sam":
             with open(file_path, 'r') as f:
                 for line in f:
-                    if line.startswith('@'): 
+                    if line.startswith('@'):
                         continue
                     parts = line.split('\t')
-                    if len(parts) < 11: 
+                    if len(parts) < 11:
                         continue
                     
                     read_id = parts[0]
-
-                    # Priority 1: annotation inside the record
                     found_bc = None
+                    tag_present = False
+
                     for field in parts[11:]:
                         if field.startswith("BC:Z:"):
-                            found_bc = field.split(":")[2].strip()
+                            tag_present = True
+                            val = field.split(":")[2].strip()
+                            match = BARCODE_RE.search(val)
+                            found_bc = match.group() if match else None
                             break
                         elif field.startswith("RG:Z:"):
+                            tag_present = True
                             match = BARCODE_RE.search(field)
                             found_bc = match.group() if match else None
                             break
 
-                    # Priority 2: inferred from file/folder name
                     if not found_bc:
                         found_bc = path_bc
-
-                    # Priority 3: explicit user fallback
-                    if not found_bc:
+                    if not found_bc and not tag_present:
                         found_bc = known_bc
 
                     if found_bc:
@@ -315,25 +314,26 @@ def parse_single_mapping_file(
                 with pysam.AlignmentFile(file_path, mode, check_sq=False) as samfile:
                     for read in samfile.fetch(until_eof=True):
                         read_id = read.query_name
-
-                        # Priority 1: annotation inside the record
                         found_bc = None
+                        tag_present = False
+
                         try:
-                            found_bc = read.get_tag("BC")
+                            bc_val = read.get_tag("BC")
+                            tag_present = True
+                            match = BARCODE_RE.search(str(bc_val))
+                            found_bc = match.group() if match else None
                         except KeyError:
                             try:
                                 rg = read.get_tag("RG")
+                                tag_present = True
                                 match = BARCODE_RE.search(str(rg))
                                 found_bc = match.group() if match else None
                             except KeyError:
                                 pass
 
-                        # Priority 2: inferred from file/folder name
                         if not found_bc:
                             found_bc = path_bc
-
-                        # Priority 3: explicit user fallback
-                        if not found_bc:
+                        if not found_bc and not tag_present:
                             found_bc = known_bc
 
                         if found_bc:
@@ -350,18 +350,19 @@ def parse_single_mapping_file(
         try:
             with open_func(file_path, mode) as handle:
                 for record in SeqIO.parse(handle, "fastq"):
-                    # Priority 1: barcode in the FASTQ header
                     found_bc = None
-                    match = BARCODE_RE.search(record.description)
-                    if match:
-                        found_bc = match.group()
+                    tag_present = False
 
-                    # Priority 2: inferred from file/folder name
+                    # For FASTQ: check if header contains any barcode-like field.
+                    # "barcode=unclassified" or similar counts as tag_present.
+                    if "barcode" in record.description.lower():
+                        tag_present = True
+                        match = BARCODE_RE.search(record.description)
+                        found_bc = match.group() if match else None
+
                     if not found_bc:
                         found_bc = path_bc
-
-                    # Priority 3: explicit user fallback
-                    if not found_bc:
+                    if not found_bc and not tag_present:
                         found_bc = known_bc
 
                     if found_bc:
@@ -389,9 +390,7 @@ def _detect_bc_from_path(input_path: str) -> Optional[str]:
     Returns the detected barcode string (e.g. 'barcode05') or None.
     """
     p = Path(input_path)
-    # Check directory name or file stem
     name = p.name if p.is_dir() else p.stem
-    # Strip .fastq from double-extension files like barcode05.fastq.gz
     name = name.replace(".fastq", "")
     match = BARCODE_RE.fullmatch(name)
     return match.group() if match else None
@@ -404,16 +403,15 @@ def load_barcode_map_parallel(
     n_cores: int,
 ) -> Tuple[Dict, Dict, Dict]:
     """
-    Locates mapping files in the input path and constructs a large 
+    Locates mapping files in the input path and constructs a large
     lookup dictionary in parallel using multiple CPU cores.
 
     Barcode assignment priority (applied per read, inside each worker):
-      1. Annotation inside the file   (BC/RG tag in BAM/SAM; barcode in FASTQ header)
-      2. Barcode inferred from path   (file or parent directory named barcodeXX)
-      3. Explicit user fallback       (--bc / known_bc)
-
-    The known_bc parameter also acts as an output filter after the map is built:
-    reads assigned to any other barcode are removed from the result.
+      1. Annotation inside the file (BC/RG tag in BAM/SAM; barcode in FASTQ header)
+         Reads with a BC/RG tag that does not match barcodeXX (e.g. "unclassified")
+         are treated as explicitly unclassified — known_bc is NOT applied to them.
+      2. Barcode inferred from path (file or parent directory named barcodeXX)
+      3. Explicit user fallback (--bc / known_bc) — only when no tag was present
     """
     is_fmap = (output_format == "folder")
     input_format, path_type = detect_format(input_path)
@@ -421,7 +419,6 @@ def load_barcode_map_parallel(
     if not input_format:
         raise ValueError(f"Cannot detect input format for {input_path}")
 
-    # Discover files based on detected format
     if input_format == "fastq":
         files = glob.glob(os.path.join(input_path, "**", f"*.{input_format}*"), recursive=True) if path_type == "dir" else [input_path]
     else:
@@ -430,18 +427,9 @@ def load_barcode_map_parallel(
     print(f"-> Found {len(files)} mapping files ({input_format.upper()}). Loading in parallel...")
 
     def make_worker_args(file_path: str) -> tuple:
-        """
-        Build the argument tuple for parse_single_mapping_file.
-
-        path_bc is detected from the file itself or its parent directory.
-        known_bc is passed separately and used only as a last resort inside
-        the worker — it is never promoted to override in-file annotations.
-        """
         path_bc = _detect_bc_from_path(file_path)
         if not path_bc:
-            # Also check the immediate parent directory
             path_bc = _detect_bc_from_path(str(Path(file_path).parent))
-
         return (file_path, input_format, is_fmap, path_bc, known_bc)
 
     worker_args = [make_worker_args(f) for f in files]

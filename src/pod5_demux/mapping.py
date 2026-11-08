@@ -39,7 +39,10 @@ _BAM_RECORD_HEADER = struct.Struct('<4s4sBBHHHI4s4s4s')  # 32 bytes
 # ---------------------------------------------------------------------------
 # BGZF Decompression - SAMv1 Section 4.1
 # ---------------------------------------------------------------------------
- 
+ # BAM tag parsing logic inspired by bamnostic
+# https://github.com/betteridiot/bamnostic
+# Sherman & Mills, JOSS 2018 (doi:10.21105/joss.00826)
+
 def _read_bgzf_blocks(file_path: str) -> bytes:
     """
     Decompresses a BGZF file into a single bytearray.

@@ -66,6 +66,7 @@ def split_one_pod5_by_barcode(
                     stats["bc_counts"][bc_name] = stats["bc_counts"].get(bc_name, 0) + 1
                 except Exception as e:
                     print(f"[Error] Failed to write ID {read_id}: {e}")
+                    raise
     finally:
         stats["n_files"] = len(writers)
         # Close all writers to avoid corrupted files

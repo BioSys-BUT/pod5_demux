@@ -77,6 +77,7 @@ def parse_single_mapping_file(
 
         except Exception as e:
             print(f"[Error] Failed to read BAM/SAM with pysam {file_path}: {e}")
+            raise
 
     elif file_type == "fastq":
         open_func = gzip.open if file_path.endswith('.gz') else open
@@ -106,6 +107,7 @@ def parse_single_mapping_file(
 
         except Exception as e:
             print(f"[Error] Failed to read FASTQ {file_path}: {e}")
+            raise
 
     for bc in mapping.values():
         map_bc_count[bc] = map_bc_count.get(bc, 0) + 1
@@ -155,8 +157,10 @@ def load_barcode_map_parallel(
 
     if input_format == "fastq":
         files = glob.glob(os.path.join(input_path, "**", f"*.{input_format}*"), recursive=True) if path_type == "dir" else [input_path]
+        files = [f for f in files if f.lower().endswith((".fastq", ".fastq.gz", ".fq", ".fq.gz"))]
     else:
         files = glob.glob(os.path.join(input_path, "**", f"*.{input_format}"), recursive=True) if path_type == "dir" else [input_path]
+        files = [f for f in files if f.lower().endswith(f".{input_format}")]
 
     print(f"-> Found {len(files)} mapping files ({input_format.upper()}). Loading in parallel...")
 
@@ -171,13 +175,30 @@ def load_barcode_map_parallel(
     barcode_map = {}
     filename_map = {}
     map_bc_count = {}
+    duplicates = 0
+    conflicts = 0
 
     with Pool(processes=n_cores) as pool:
         results = pool.starmap(parse_single_mapping_file, worker_args)
         for m, fm, bc_count in results:
-            barcode_map.update(m)
+            for read_id, bc in m.items():
+                if read_id in barcode_map:
+                    duplicates += 1
+                    if barcode_map[read_id] != bc:
+                        conflicts += 1
+                else:
+                    barcode_map[read_id] = bc
+
             filename_map.update(fm)
-            for bc, count in bc_count.items():
-                map_bc_count[bc] = map_bc_count.get(bc, 0) + count
+
+    # Count barcodes in the final merged mapping
+    for bc in barcode_map.values():
+        map_bc_count[bc] = map_bc_count.get(bc, 0) + 1
+
+    if duplicates > 0:
+        if conflicts > 0:
+            print(f"[Warning] Found {duplicates} duplicate reads in mapping files ({conflicts} with conflicting barcodes)!")
+        else:
+            print(f"[Warning] Found {duplicates} duplicate reads in mapping files!")
 
     return barcode_map, filename_map, map_bc_count

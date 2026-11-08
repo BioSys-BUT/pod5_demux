@@ -72,6 +72,9 @@ def run_demultiplexing(
     except ValueError as e:
         print(f"Critical error: {e}")
         raise typer.Exit(code=1)
+    except Exception as e:
+        print(f"Critical error loading mapping files: {e}")
+        raise typer.Exit(code=1)
 
     if not bc_map:
         print("!!! Process terminated: No barcodes found in mapping files.")

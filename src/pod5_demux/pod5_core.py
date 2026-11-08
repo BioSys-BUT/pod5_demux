@@ -1,7 +1,5 @@
 # src/pod5_demux/pod5_core.py
 import os
-import sys
-import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -35,7 +33,6 @@ def split_one_pod5_by_barcode(
     temp_dir = os.path.join(output_dir, "temp_parts")
 
     writers = {}
-    run_infos = {}  # barcode -> set of acquisition_ids already added to the writer
     stats = {"processed": 0, "sorted": 0, "unclassified": 0, "bc_counts": {}, "n_files": 0}
 
     try:
@@ -59,13 +56,6 @@ def split_one_pod5_by_barcode(
                     else:
                         out_path = os.path.join(temp_dir, f"{bc_name}__{source_name}.pod5")
                     writers[bc_name] = pod5.Writer(out_path)
-                    run_infos[bc_name] = set()
-
-                # Register each run_info once per writer
-                acq_id = read_record.run_info.acquisition_id
-                if acq_id not in run_infos[bc_name]:
-                    writers[bc_name]._add_run_info(read_record.run_info)
-                    run_infos[bc_name].add(acq_id)
 
                 try:
                     writers[bc_name].add_read(read_record.to_read())
@@ -87,37 +77,20 @@ def split_one_pod5_by_barcode(
 
 def merge_pod5_files(args: Tuple[list, str]):
     """
-    Merges multiple temporary POD5 files into one final file.
-    1. `pod5 merge` from PATH
-    2. `python -m pod5 merge` using the current interpreter
-    3. pod5 Python API (slowest)
+    Merges multiple temporary POD5 files into one final file using pod5 Python API.
     """
     input_files, output_file = args
-    try:
-        subprocess.run(
-            ["pod5", "merge"] + input_files + ["-o", output_file],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pod5", "merge"] + input_files + ["-o", output_file],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            print(f"  [Info] Subprocess merge failed, using Python API fallback for {Path(output_file).name}")
-
-            seen = set()
-            with pod5.Writer(output_file) as writer:
-                for file in input_files:
-                    with pod5.Reader(file) as reader:
-                        for read_rec in reader.reads():
-                            acq_id = read_rec.run_info.acquisition_id
-                            if acq_id not in seen:
-                                writer._add_run_info(read_rec.run_info)
-                                seen.add(acq_id)
-                            writer.add_read(read_rec.to_read())
+    if os.path.exists(output_file):
+        os.remove(output_file)
+    # Check that inputs exist
+    for file in input_files:
+        if not os.path.exists(file):
+            raise FileNotFoundError(f"POD5 file not found: {file}")
+    with pod5.Writer(output_file) as writer:
+        for file in input_files:
+            try:
+                with pod5.Reader(file) as reader:
+                    for read_rec in reader.reads():
+                        writer.add_read(read_rec.to_read())
+            except Exception as e:
+                print(f"[Error] Failed to read POD5 file {file}: {e}")

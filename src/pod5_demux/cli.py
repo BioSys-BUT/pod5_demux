@@ -71,11 +71,11 @@ def run_demultiplexing(
         bc_map, _, map_stats = load_barcode_map_parallel(input_seq, output_mode, known_bc, n_cores)
     except ValueError as e:
         print(f"Critical error: {e}")
-        return
+        raise typer.Exit(code=1)
 
     if not bc_map:
         print("!!! Process terminated: No barcodes found in mapping files.")
-        return
+        raise typer.Exit(code=1)
 
     # Validate --bc and keep only the target barcode
     if known_bc:
@@ -97,7 +97,7 @@ def run_demultiplexing(
         pod5_files = [input_pod5]
     if not pod5_files:
         print("!!! Process terminated: No source POD5 files found.")
-        return
+        raise typer.Exit(code=1)
 
     # Output names are derived from the POD5 file names, so they must be unique
     stems = [os.path.splitext(os.path.basename(f))[0] for f in pod5_files]

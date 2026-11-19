@@ -2,16 +2,19 @@
 import os
 from pathlib import Path
 from typing import Optional, Tuple
+import copy
+import uuid
 
 import pod5
 
 # Barcode lookup table shared by workers (set once per worker process)
 _BC_MAP = None
+_PARENT_MAP = None
 
-
-def _init_worker(bc_map):
-    global _BC_MAP
+def _init_worker(bc_map, parent_map=None):
+    global _BC_MAP, _PARENT_MAP
     _BC_MAP = bc_map
+    _PARENT_MAP = parent_map or {}
 
 
 def split_one_pod5_by_barcode(
@@ -19,6 +22,7 @@ def split_one_pod5_by_barcode(
     output_dir: str,
     output_mode: str,
     known_bc: Optional[str],
+    split_reads: bool = True
 ) -> dict:
     """
     Reads a single POD5 file and writes its reads, grouped by barcode.
@@ -40,33 +44,94 @@ def split_one_pod5_by_barcode(
             for read_record in reader:
                 stats["processed"] += 1
                 read_id = str(read_record.read_id)
-                bc_name = mapping.get(read_id, "unclassified")
 
-                # If a specific barcode is enforced, skip all other reads
-                if known_bc and bc_name != known_bc:
-                    stats["unclassified"] += 1
-                    continue
+                # 1. CASE: SPLIT PARENT READ INTO SUBREADS
+                if split_reads and _PARENT_MAP and read_id in _PARENT_MAP:
+                    subreads = _PARENT_MAP[read_id]
+                    parent_signal = read_record.signal
+                    split_occurred = False
 
-                # Open a writer the first time a barcode is seen in this file
-                if bc_name not in writers:
-                    if output_mode == "folder":
-                        bc_dir = os.path.join(output_dir, bc_name)
-                        os.makedirs(bc_dir, exist_ok=True)
-                        out_path = os.path.join(bc_dir, f"{source_name}.pod5")
-                    else:
-                        out_path = os.path.join(temp_dir, f"{bc_name}__{source_name}.pod5")
-                    writers[bc_name] = pod5.Writer(out_path)
+                    for sub in subreads:
+                        child_bc = sub["barcode"]
+                        child_id = sub["child_id"]
 
-                try:
+                        # Filter by known barcode if provided
+                        if known_bc and child_bc != known_bc:
+                            continue
+
+                        sp = sub["sp"]
+                        ns = sub["ns"]
+                        ts = sub["ts"]
+
+                        start_sample = sp + ts
+                        end_sample = (sp + ns) if ns is not None else len(parent_signal)
+                        sliced_signal = parent_signal[start_sample:end_sample]
+
+                        # Open writer for the given barcode (if not already open)
+                        if child_bc not in writers:
+                            if output_mode == "folder":
+                                bc_dir = os.path.join(output_dir, child_bc)
+                                os.makedirs(bc_dir, exist_ok=True)
+                                out_path = os.path.join(bc_dir, f"{source_name}.pod5")
+                            else:
+                                out_path = os.path.join(temp_dir, f"{child_bc}__{source_name}.pod5")
+                            writers[child_bc] = pod5.Writer(out_path)
+
+                        # Create a new read record for the subread and write it with new uuid
+                        child_read = copy.copy(read_record.to_read())
+                        child_read.read_id = uuid.UUID(child_id)
+                        child_read.start_sample += start_sample
+                        child_read.signal = sliced_signal
+
+                        writers[child_bc].add_read(child_read)
+                        stats["sorted"] += 1
+                        stats["subreads_created"] = stats.get("subreads_created", 0) + 1
+                        stats["bc_counts"][child_bc] = stats["bc_counts"].get(child_bc, 0) + 1
+                        split_occurred = True
+
+                    if split_occurred:
+                        stats["split_parents"] = stats.get("split_parents", 0) + 1
+                    elif known_bc:
+                        stats["unclassified"] += 1
+
+                # 2. CASE: READ IS IN MAPPING (NOT A PARENT READ)
+                elif read_id in mapping:
+                    bc_name = mapping[read_id]
+                    if known_bc and bc_name != known_bc:
+                        stats["unclassified"] += 1
+                        continue
+
+                    # Open a writer the first time a barcode is seen in this file
+                    if bc_name not in writers:
+                        if output_mode == "folder":
+                            bc_dir = os.path.join(output_dir, bc_name)
+                            os.makedirs(bc_dir, exist_ok=True)
+                            out_path = os.path.join(bc_dir, f"{source_name}.pod5")
+                        else:
+                            out_path = os.path.join(temp_dir, f"{bc_name}__{source_name}.pod5")
+                        writers[bc_name] = pod5.Writer(out_path)
+
                     writers[bc_name].add_read(read_record.to_read())
                     if bc_name != "unclassified":
                         stats["sorted"] += 1
                     else:
                         stats["unclassified"] += 1
                     stats["bc_counts"][bc_name] = stats["bc_counts"].get(bc_name, 0) + 1
-                except Exception as e:
-                    print(f"[Error] Failed to write ID {read_id}: {e}")
-                    raise
+
+                # 3. CASE: READ IS NOT IN MAPPING AND NOT A PARENT READ
+                else:
+                    if not known_bc:
+                        bc_name = "unclassified"
+                        if bc_name not in writers:
+                            if output_mode == "folder":
+                                bc_dir = os.path.join(output_dir, bc_name)
+                                os.makedirs(bc_dir, exist_ok=True)
+                                out_path = os.path.join(bc_dir, f"{source_name}.pod5")
+                            else:
+                                out_path = os.path.join(temp_dir, f"{bc_name}__{source_name}.pod5")
+                            writers[bc_name] = pod5.Writer(out_path)
+                        writers[bc_name].add_read(read_record.to_read())
+                    stats["unclassified"] += 1
     finally:
         stats["n_files"] = len(writers)
         # Close all writers to avoid corrupted files

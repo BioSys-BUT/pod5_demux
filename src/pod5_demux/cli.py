@@ -42,6 +42,7 @@ def run_demultiplexing(
     output_mode: OutputMode,
     n_cores: int,
     overwrite: bool = False,
+    split_reads: bool = True,
 ):
     """
     Orchestrates the workflow: build the barcode lookup table, split the POD5
@@ -68,7 +69,7 @@ def run_demultiplexing(
 
     # LOAD MAP
     try:
-        bc_map, _, map_stats = load_barcode_map_parallel(input_seq, output_mode, known_bc, n_cores)
+        bc_map, parent_map, _, map_stats = load_barcode_map_parallel(input_seq, output_mode, known_bc, n_cores, split_reads=split_reads)
     except ValueError as e:
         print(f"Critical error: {e}")
         raise typer.Exit(code=1)
@@ -119,9 +120,10 @@ def run_demultiplexing(
         output_dir=output_dir,
         output_mode=output_mode,
         known_bc=known_bc,
+        split_reads=split_reads,
     )
 
-    with Pool(n_cores, initializer=_init_worker, initargs=(bc_map,)) as p:
+    with Pool(n_cores, initializer=_init_worker, initargs=(bc_map, parent_map)) as p:
         results = p.map(worker_pod5, pod5_files)
 
     total_reads = sum(r["processed"] for r in results)
@@ -255,8 +257,10 @@ def main(
                                          help="Number of CPU threads used for processing.")] = 8,
     overwrite: Annotated[bool, typer.Option("--overwrite",
                                             help="Automatically delete and recreate the output directory if it already exists and is not empty.")] = False,
+    split_reads: Annotated[bool, typer.Option("--split-reads/--no-split-reads",
+                                            help="Automatically detect and split concatenated parent reads from BAM/SAM into sub-reads.")] = True
 ):
     """
     Starts the demultiplexing process.
     """
-    run_demultiplexing(seq, pod5_path, output, known_bc, mode, threads, overwrite)
+    run_demultiplexing(seq, pod5_path, output, known_bc, mode, threads, overwrite, split_reads)

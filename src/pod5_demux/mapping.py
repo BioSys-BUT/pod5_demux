@@ -21,7 +21,8 @@ def parse_single_mapping_file(
     is_fmap: bool,
     path_bc: Optional[str],
     known_bc: Optional[str],
-) -> Tuple[Dict, Dict, Dict]:
+    split_reads: bool = True,
+) -> Tuple[Dict, Dict, Dict, Dict]:
     """
     Parses a single sequence mapping file (BAM, SAM, or FASTQ) and extracts
     read-to-barcode mappings. 
@@ -34,6 +35,7 @@ def parse_single_mapping_file(
       3. Explicit user fallback (--bc / known_bc) — only when no tag was present
     """
     mapping = {}
+    parent_mapping = {}
     filename_map = {}
     map_bc_count = {}
     
@@ -71,7 +73,28 @@ def parse_single_mapping_file(
                         found_bc = known_bc
 
                     if found_bc:
-                        mapping[read_id] = found_bc
+                        pi_tag = None
+                        if split_reads:
+                            try:
+                                pi_val = str(read.get_tag("pi"))
+                                if pi_val and pi_val != read_id:
+                                    pi_tag = pi_val
+                            except KeyError:
+                                pi_tag = None
+                        if pi_tag:
+                            # Sub-reads are grouped under their parent read ID in parent_mapping
+                            sp = read.get_tag("sp") if read.has_tag("sp") else 0
+                            ns = read.get_tag("ns") if read.has_tag("ns") else None
+                            ts = read.get_tag("ts") if read.has_tag("ts") else 0
+                            parent_mapping.setdefault(pi_tag, []).append({
+                                "child_id": read_id,
+                                "barcode": found_bc,
+                                "sp": int(sp),
+                                "ns": int(ns) if ns is not None else None,
+                                "ts": int(ts),
+                            })
+                        else:
+                            mapping[read_id] = found_bc
                         if is_fmap:
                             filename_map[read_id] = clean_filename
 
@@ -101,6 +124,15 @@ def parse_single_mapping_file(
                         found_bc = known_bc
 
                     if found_bc:
+                        m_parent = re.search(r"parent_read_id=([^\s]+)", record.description)
+                        if m_parent:
+                            parent_id = m_parent.group(1)
+                            if parent_id != record.id:
+                                print(
+                                    f"[Warning] FASTQ record '{record.id}' contains parent_read_id '{parent_id}' "
+                                    f"(split read). FASTQ format does not contain signal coordinates (sp/ns tags); "
+                                    f"for physical POD5 splitting, please use BAM or SAM format."
+                                )
                         mapping[record.id] = found_bc
                         if is_fmap:
                             filename_map[record.id] = clean_filename
@@ -112,7 +144,7 @@ def parse_single_mapping_file(
     for bc in mapping.values():
         map_bc_count[bc] = map_bc_count.get(bc, 0) + 1
 
-    return mapping, filename_map, map_bc_count
+    return mapping, parent_mapping, filename_map, map_bc_count
 
 
 def _detect_bc_from_path(input_path: str) -> Optional[str]:
@@ -137,7 +169,8 @@ def load_barcode_map_parallel(
     output_format: str,
     known_bc: Optional[str],
     n_cores: int,
-) -> Tuple[Dict, Dict, Dict]:
+    split_reads: bool = True,
+) -> Tuple[Dict, Dict, Dict, Dict]:
     """
     Locates mapping files in the input path and constructs a large
     lookup dictionary in parallel using multiple CPU cores.
@@ -168,11 +201,12 @@ def load_barcode_map_parallel(
         path_bc = _detect_bc_from_path(file_path)
         if not path_bc:
             path_bc = _detect_bc_from_path(str(Path(file_path).parent))
-        return (file_path, input_format, is_fmap, path_bc, known_bc)
+        return (file_path, input_format, is_fmap, path_bc, known_bc, split_reads)
 
     worker_args = [make_worker_args(f) for f in files]
 
     barcode_map = {}
+    parent_map = {}
     filename_map = {}
     map_bc_count = {}
     duplicates = 0
@@ -180,7 +214,7 @@ def load_barcode_map_parallel(
 
     with Pool(processes=n_cores) as pool:
         results = pool.starmap(parse_single_mapping_file, worker_args)
-        for m, fm, bc_count in results:
+        for m, pm, fm, bc_count in results:
             for read_id, bc in m.items():
                 if read_id in barcode_map:
                     duplicates += 1
@@ -188,6 +222,8 @@ def load_barcode_map_parallel(
                         conflicts += 1
                 else:
                     barcode_map[read_id] = bc
+            for parent_id, sub_list in pm.items():
+                parent_map.setdefault(parent_id, []).extend(sub_list)
 
             filename_map.update(fm)
 
@@ -201,4 +237,4 @@ def load_barcode_map_parallel(
         else:
             print(f"[Warning] Found {duplicates} duplicate reads in mapping files!")
 
-    return barcode_map, filename_map, map_bc_count
+    return barcode_map, parent_map, filename_map, map_bc_count
